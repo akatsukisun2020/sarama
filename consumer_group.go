@@ -212,7 +212,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
-	// Join consumer group
+	// Join consumer group // by sun: coordinator 看起来就是，在所有的broker之中，为每一个消费组选的一个协调的节点。
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if err != nil {
 		_ = coordinator.Close()
@@ -240,6 +240,9 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return nil, join.Err
 	}
 
+	// by sun: 已经加入成功这个group，并且，成为了这个group中的一个leader;于是，需要制定消费方案  ==> 轮询？hash？
+	// ==> 也就是，如何将这些消费topic分配给各个消费组使用？
+	// 各个消费组的使用计划，是由消费组中的leader进行指定的。指定的依赖 {topic的partiotion分布，group的consumer分布, 用户指定的消费策略}
 	// Prepare distribution plan if we joined as the leader
 	var plan BalanceStrategyPlan
 	if join.LeaderId == join.MemberId {
@@ -254,6 +257,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 	}
 
+	// by sun: 向本消费组的leader，同步生成的消费计划信息
 	// Sync consumer group
 	groupRequest, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
 	if err != nil {
@@ -657,6 +661,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	default:
 	}
 
+	// by sun: 能找到，就强制使用最新的offset
 	// get next offset
 	offset := s.parent.config.Consumer.Offsets.Initial
 	if pom := s.offsets.findPOM(topic, partition); pom != nil {
@@ -664,6 +669,8 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	}
 
 	// create new claim
+	// ==> by sun:  这里面，会针对partition开单独的协程，每一个协程对应一个partion去进行消费。消费的内容放到一个chan中，对外提供队列式消费功能!!
+	// ==> fixme:  需要注意的是，这里是chan的单通道，也就是，这里看起来，没有所谓的批量消费多少的功能。一次就是取一个。没有消费就会阻塞起来！！
 	claim, err := newConsumerGroupClaim(s, topic, partition, offset)
 	if err != nil {
 		s.parent.handleError(err, topic, partition)
@@ -686,8 +693,8 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 		claim.AsyncClose()
 	}()
 
-	// start processing
-	if err := s.handler.ConsumeClaim(s, claim); err != nil {
+	// start processing  // 消费者的一个协程将数据放入到了 Messages中，这里只用从中消费！！ chan队列！！
+	if err := s.handler.ConsumeClaim(s, claim); err != nil { // by sun 这个hander就是需要处理的内容！！，用户自定义实现的函数
 		s.parent.handleError(err, topic, partition)
 	}
 
@@ -800,9 +807,11 @@ type ConsumerGroupHandler interface {
 	// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
 	// Once the Messages() channel is closed, the Handler must finish its processing
 	// loop and exit.
+	// by sun: 整个消费的重载器!! ==> 需要用户自己实现
 	ConsumeClaim(ConsumerGroupSession, ConsumerGroupClaim) error
 }
 
+// 实际上，就是对应一个分区的消费者。 的一个 消费句柄！！ ==> 的抽象!!
 // ConsumerGroupClaim processes Kafka messages from a given topic and partition within a consumer group.
 type ConsumerGroupClaim interface {
 	// Topic returns the consumed topic name.

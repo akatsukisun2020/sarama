@@ -513,7 +513,7 @@ func (client *client) Controller() (*Broker, error) {
 		return nil, ErrUnsupportedVersion
 	}
 
-	controller := client.cachedController()
+	controller := client.cachedController() // 主控broker
 	if controller == nil {
 		if err := client.refreshMetadata(); err != nil {
 			return nil, err

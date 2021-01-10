@@ -79,6 +79,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 }
 
 func (om *offsetManager) ManagePartition(topic string, partition int32) (PartitionOffsetManager, error) {
+	// by sun: 这里有rpc，从broker的协调节点中，获取现有的偏移量!
 	pom, err := om.newPartitionOffsetManager(topic, partition)
 	if err != nil {
 		return nil, err
