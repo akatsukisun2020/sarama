@@ -76,11 +76,12 @@ type Consumer interface {
 	Close() error
 }
 
+//单个消费者，定义 单个消费者中 （1）消费的所有的 <topic,partitioner> （2）管理对接的服务端的 消费的broker列表
 type consumer struct {
-	conf            *Config
-	children        map[string]map[int32]*partitionConsumer
-	brokerConsumers map[*Broker]*brokerConsumer
-	client          Client
+	conf            *Config                                 // 依赖的配置
+	children        map[string]map[int32]*partitionConsumer // 消费的所有的 <topic,partitioner>  ==> 需要消费的东西
+	brokerConsumers map[*Broker]*brokerConsumer             // 管理对接的服务端的 消费的broker列表 ==> 指定消费的地方，去哪里消费
+	client          Client                                  // 对外的client？是否有连接优化等？
 	lock            sync.Mutex
 }
 
@@ -130,6 +131,7 @@ func (c *consumer) Partitions(topic string) ([]int32, error) {
 	return c.client.Partitions(topic)
 }
 
+// 这个函数是从 远端broker将数据 读取 到机器内存队列中，给用户自定义函数消费的逻辑！！ 【这个接口很重要】
 func (c *consumer) ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
 	child := &partitionConsumer{
 		consumer:  c,
@@ -148,6 +150,7 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		return nil, err
 	}
 
+	// 看起来像是查询 单个partition的主副本数据！！
 	var leader *Broker
 	var err error
 	if leader, err = c.client.Leader(child.topic, child.partition); err != nil {
@@ -158,11 +161,14 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		return nil, err
 	}
 
-	go withRecover(child.dispatcher)
+	// 分发从服务端broker消费到的消息
+	go withRecover(child.dispatcher) // 周期性触发消费这个分区！！[这个貌似只是一个触发器，艹！！] [很重要！！]
+	// 这个才是核心的 数据传导函数，解析从broker中获取的数据，并将这些数据 通过chan传递给用户自己 处理 ！！
 	go withRecover(child.responseFeeder)
 
+	// 这个执行rpc，从远端broker获取数据的关键函数
 	child.broker = c.refBrokerConsumer(leader)
-	child.broker.input <- child
+	child.broker.input <- child // 首次触发消费这个分区
 
 	return child, nil
 }
@@ -214,7 +220,7 @@ func (c *consumer) refBrokerConsumer(broker *Broker) *brokerConsumer {
 
 	bc := c.brokerConsumers[broker]
 	if bc == nil {
-		bc = c.newBrokerConsumer(broker)
+		bc = c.newBrokerConsumer(broker) // 内部协程rpc到broker，拉取数据消费
 		c.brokerConsumers[broker] = bc
 	}
 
@@ -305,7 +311,7 @@ type partitionConsumer struct {
 
 	preferredReadReplica int32
 
-	trigger, dying chan none
+	trigger, dying chan none // trigger 是周期性触发器, dying 则是对象回收的时候的触发器
 	closeOnce      sync.Once
 	topic          string
 	partition      int32
@@ -331,6 +337,7 @@ func (child *partitionConsumer) sendError(err error) {
 	}
 }
 
+// computeBackoff 计算时间退避的策略!! ==> 实际上就是重试次数的策略封装 || 用户没有定义，就2s退避一次！！
 func (child *partitionConsumer) computeBackoff() time.Duration {
 	if child.conf.Consumer.Retry.BackoffFunc != nil {
 		retries := atomic.AddInt32(&child.retries, 1)
@@ -339,6 +346,7 @@ func (child *partitionConsumer) computeBackoff() time.Duration {
 	return child.conf.Consumer.Retry.Backoff
 }
 
+// 这个叼毛好像是周期性 将自己(partitionConsumer给他添加到broker.input中，来达到周期性触发的目的！！)
 func (child *partitionConsumer) dispatcher() {
 	for range child.trigger {
 		select {
@@ -351,7 +359,7 @@ func (child *partitionConsumer) dispatcher() {
 			}
 
 			Logger.Printf("consumer/%s/%d finding new broker\n", child.topic, child.partition)
-			if err := child.dispatch(); err != nil {
+			if err := child.dispatch(); err != nil { //
 				child.sendError(err)
 				child.trigger <- none{}
 			}
@@ -389,7 +397,7 @@ func (child *partitionConsumer) dispatch() error {
 
 	child.broker = child.consumer.refBrokerConsumer(broker)
 
-	child.broker.input <- child
+	child.broker.input <- child // 核心代码==> 将自己放入到input中，投递之后，就可以消费到了!!
 
 	return nil
 }
@@ -461,7 +469,7 @@ func (child *partitionConsumer) responseFeeder() {
 
 feederLoop:
 	for response := range child.feeder {
-		msgs, child.responseResult = child.parseResponse(response)
+		msgs, child.responseResult = child.parseResponse(response) // 这里是消息解析，将从broker中的数据解析成标准格式!!
 
 		if child.responseResult == nil {
 			atomic.StoreInt32(&child.retries, 0)
@@ -476,7 +484,7 @@ feederLoop:
 			case <-child.dying:
 				child.broker.acks.Done()
 				continue feederLoop
-			case child.messages <- msg:
+			case child.messages <- msg: // 这个是核心，每次从broker中获取数据之后，将数据放入到child.messages中；这样，用户自定义函数就能够获取到，并进行处理了！！
 				firstAttempt = true
 			case <-expiryTicker.C:
 				if !firstAttempt {
@@ -485,7 +493,7 @@ feederLoop:
 				remainingLoop:
 					for _, msg = range msgs[i:] {
 						select {
-						case child.messages <- msg:
+						case child.messages <- msg: // 这里只是重试之后的结果！！
 						case <-child.dying:
 							break remainingLoop
 						}
@@ -718,9 +726,9 @@ func (child *partitionConsumer) parseResponse(response *FetchResponse) ([]*Consu
 type brokerConsumer struct {
 	consumer         *consumer
 	broker           *Broker
-	input            chan *partitionConsumer
-	newSubscriptions chan []*partitionConsumer
-	subscriptions    map[*partitionConsumer]none
+	input            chan *partitionConsumer     // input是为了接受 单个分区消费者 的单次请求的
+	newSubscriptions chan []*partitionConsumer   // 这个是用来管理，多个分区消费者来了的时候，会先批量存放在这里
+	subscriptions    map[*partitionConsumer]none // 这个是对newSubscriptions的去重操作，保证相同的分区消费者都只有一次远程到broker上取数据
 	wait             chan none
 	acks             sync.WaitGroup
 	refs             int
@@ -737,11 +745,15 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 		refs:             0,
 	}
 
-	go withRecover(bc.subscriptionManager)
-	go withRecover(bc.subscriptionConsumer)
+	go withRecover(bc.subscriptionManager)  // 管理单个broker中的多个 parition消费者
+	go withRecover(bc.subscriptionConsumer) // 管理每个 消费者的数据，通过rpc获取真实的 kafka数据
 
 	return bc
 }
+
+// 这个应该是订阅分区消费者管理器。
+// 这个的作用应该是用来管理这个 所有消费这个broker的consumer；所以才叫 brokerconsumer。
+// input就是新的，消费这个broker的消费者。
 
 // The subscriptionManager constantly accepts new subscriptions on `input` (even when the main subscriptionConsumer
 // goroutine is in the middle of a network request) and batches it up. The main worker goroutine picks
@@ -783,12 +795,15 @@ done:
 	close(bc.newSubscriptions)
 }
 
+// 相比于上面的元数据管理函数，这个函数更加倾向于管理， 这个broker的所有的消费者中的 每一个消费者 的数据本身，就不是关注与 元数据了！！
+// FIXME: 比较重要的好处是，能够实现批量读！！多次rpc汇聚成单次rpc，实现批量读功能!!
+
 //subscriptionConsumer ensures we will get nil right away if no new subscriptions is available
 func (bc *brokerConsumer) subscriptionConsumer() {
 	<-bc.wait // wait for our first piece of work
 
-	for newSubscriptions := range bc.newSubscriptions {
-		bc.updateSubscriptions(newSubscriptions)
+	for newSubscriptions := range bc.newSubscriptions { // 这个是批量处理，chan中可能传递多个 "分区消费者"
+		bc.updateSubscriptions(newSubscriptions) // 看起来就是单纯变成map，去重吧!!
 
 		if len(bc.subscriptions) == 0 {
 			// We're about to be shut down or we're about to receive more subscriptions.
@@ -797,6 +812,8 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 			continue
 		}
 
+		// 这个是从broker中 获取数据的核心函数；内部包含RPC操作。
+		// 注意：整体的汇聚的好处是，将同一个broker上的请求，批量汇聚到一个请求中，这样，就可以将不同的topic的同一个broker中的 多次RPC请求，汇聚成一个rpc拉取数据
 		response, err := bc.fetchNewMessages()
 
 		if err != nil {
@@ -805,11 +822,14 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 			return
 		}
 
+		// 拿到消息之后，将消息扔给partitionConsumer自己去处理？
+		// 问题： 一个 newSubscriptions 是有多个 subscriptions吗？
+		//为啥一个newSubscriptions的获取的数据，要分配给多个 subscriptions? [TODO] ==> 这里的数据流有点绕!!
 		bc.acks.Add(len(bc.subscriptions))
 		for child := range bc.subscriptions {
-			child.feeder <- response
+			child.feeder <- response // 消息转发给消息处理器来处理
 		}
-		bc.acks.Wait()
+		bc.acks.Wait() // 等到所有的消息都ack了之后，就ok了！！
 		bc.handleResponses()
 	}
 }

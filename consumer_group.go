@@ -12,6 +12,33 @@ import (
 // ErrClosedConsumerGroup is the error returned when a method is called on a consumer group that has been closed.
 var ErrClosedConsumerGroup = errors.New("kafka: tried to use a consumer group that was closed")
 
+// FIXME: BY SUN
+// 1. 编程模式中的"依赖倒置"原则：
+// 这里，所有的类都是用interface接口的形式对外提供服务的；
+// 所有的结构体，都是小写的，对外不可见，需要对外可见的，提供的是 New方法。
+
+// 2. 这个文件中ConsumerGroup的核心代码逻辑:
+// 2.1 消费者加入到一个给定topics的组，并启动一个阻塞的Session，贯穿整个ConsumerGroupHandler的处理过程
+// 2.2 会话的生命周期：
+//      (a) 消费者加入 组中，之后会被公平分配给他 partitions，此时，消费者被称作 "claims" ==> 貌似可以理解为一个 “小型的应用”;
+//      (b) 开始启动处理前，会调用用户自定义的Setup()函数；
+//      (c) 对于每一个消费者“claims”，都会在一个单独的协程中，调用线程安全的ConsumeClaim函数；
+//      (d) session退出的时候，通常是某一个ConsumeClaim退出的时候，通常是由于被父协程终止或者 是服务端重新负载均衡导致的;
+//      (e) 所有的ConsumeClaim退出之后，Cleanup会被调用，用于业务自定义清理操作;
+//      (f) session被释放之前，偏移量最后会被提交一次。
+
+// 3.核心对象
+// 3.1 ConsumerGroupHandler
+//     这个是消费者处理函数，是用于给业务留的核心的，业务自定义的 处理接口。主要留了三个接口，session构建之前的预处理函数Setup，建立之后的处理函数，和清理之前的析构函数Cleanup。
+//     这种设计方式以后可以使用，通过接口的形式给业务提供接入方式！！
+// 3.2 ConsumerGroupSession
+//     这个是Session消费组中，单个成员的会话现场保存。
+//     貌似主要提供了 消费者在消费过程中，对偏移量的管理细节。
+// 3.3 ConsumerGroupClaim
+//     这个貌似就是提供真实的消息消费的方法。
+// 3.4 ConsumerGroup
+//     这个貌似是真的消费者组，对用于提供的接口调用。
+
 // ConsumerGroup is responsible for dividing up processing of topics and partitions
 // over a collection of processes (the members of the consumer group).
 type ConsumerGroup interface {
@@ -59,8 +86,8 @@ type consumerGroup struct {
 
 	config   *Config
 	consumer Consumer
-	groupID  string
-	memberID string
+	groupID  string // 这个是topic的名字
+	memberID string // 这个是成员id，这个是动态的，每次动态分配，重启后，协调者不用关注每个动态加入的消费者的唯一ID到底是啥！！
 	errors   chan error
 
 	lock      sync.Mutex
@@ -143,6 +170,12 @@ func (c *consumerGroup) Close() (err error) {
 	return
 }
 
+// 消费的核心入口逻辑：// 业务调用方会卡在这个函数中
+// （1）更新所有的topics的元数据信息
+// （2）初始化session会话
+// （3）异步监测&校验分区数目变化
+// （4）等待session结束，结束后清理session
+
 // Consume implements ConsumerGroup.
 func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler ConsumerGroupHandler) error {
 	// Ensure group is not closed
@@ -160,10 +193,15 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 		return fmt.Errorf("no topics provided")
 	}
 
+	// 在初始化Client的参数的时候，实际上就已经开启了一个协程，会周期性对账检查topics的元数据更新的情况；
+	// 核心代码在client中，提供与服务端broker的各种操作能力！！
+
 	// Refresh metadata for requested topics
 	if err := c.client.RefreshMetadata(topics...); err != nil {
 		return err
 	}
+
+	// 初始化session是整个消费的核心流程：
 
 	// Init session
 	sess, err := c.newSession(ctx, topics, handler, c.config.Consumer.Group.Rebalance.Retry.Max)
@@ -203,6 +241,12 @@ func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, ha
 }
 
 func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler ConsumerGroupHandler, retries int) (*consumerGroupSession, error) {
+	// 协调组文档：https://blog.csdn.net/liyiming2017/article/details/82867765
+	// 查找协调者broker，也分为组协调器(协调功能svr，位于broker端) & 消费者协调器(协调功能client，位于client端)
+	// 关于协调者，实际上是代理以前zookeeper的，用来保存的是 整个kafka集群中，这个topic的元数据信息：
+	// （1）有哪些消费者： 消费者的加入、消费者的退出、消费者的心跳保持
+	// （2）每个消费者消费的偏移量等
+	// （3）leader消费者的分配，leader消费者主要的职责，就是给其他的分配者分配拥有的分区，并将结构汇报给 协调者 【不知道为啥有leader消费者这个代理？】貌似说是会减小协调组的压力！！
 	coordinator, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		if retries <= 0 {
@@ -212,7 +256,10 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
-	// Join consumer group // by sun: coordinator 看起来就是，在所有的broker之中，为每一个消费组选的一个协调的节点。
+	// 这个就是消费者协调器的一个功能，就是加入组协调器，这样，kafka系统才知道有哪些消费者连着他，才能为后续的各种分配工作搞进展！！
+	// Join.MemberId
+
+	// Join consumer group
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if err != nil {
 		_ = coordinator.Close()
@@ -220,7 +267,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 	switch join.Err {
 	case ErrNoError:
-		c.memberID = join.MemberId
+		c.memberID = join.MemberId // 记住协调组给自己编码的唯一的ID (重要)
 	case ErrUnknownMemberId, ErrIllegalGeneration: // reset member ID and retry immediately
 		c.memberID = ""
 		return c.newSession(ctx, topics, handler, retries)
@@ -240,6 +287,9 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return nil, join.Err
 	}
 
+	// 到这里，消费者就已经成功加入到了协调者了，此时之后，就需要进行 消费者进行分配了，
+	// 分配计划是 leader分配的，说的是为了避免 负载有问题！！
+
 	// by sun: 已经加入成功这个group，并且，成为了这个group中的一个leader;于是，需要制定消费方案  ==> 轮询？hash？
 	// ==> 也就是，如何将这些消费topic分配给各个消费组使用？
 	// 各个消费组的使用计划，是由消费组中的leader进行指定的。指定的依赖 {topic的partiotion分布，group的consumer分布, 用户指定的消费策略}
@@ -251,13 +301,16 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 			return nil, err
 		}
 
+		// plan 本身也是 接口开放与封闭的原则!!
 		plan, err = c.balance(members)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// by sun: 向本消费组的leader，同步生成的消费计划信息
+	// 同步生成的计划信息给 协调者。
+	// (1) leader 同步的是 有值 的 plan
+	// (2) 非leader 同步的则是空的 plan
 	// Sync consumer group
 	groupRequest, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
 	if err != nil {
@@ -285,6 +338,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return nil, groupRequest.Err
 	}
 
+	// 协调者拉取到对应的 partition的分配之后，将这些partition分配给每一个消费者，这个就是分配的结果
 	// Retrieve and sort claims
 	var claims map[string][]int32
 	if len(groupRequest.MemberAssignment) > 0 {
@@ -300,6 +354,8 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 	}
 
+	// 到此，用户就拿到了自己的 分配的所有的topic对应的partition值了！！
+	// 之后，就需要创建消费单元，来消费每一个partition中的数据！！
 	return newConsumerGroupSession(ctx, c, claims, join.MemberId, join.GenerationId, handler)
 }
 
@@ -552,6 +608,7 @@ type consumerGroupSession struct {
 	hbDying, hbDead chan none
 }
 
+// 对于每一个topic分配的partition，构建对应的协程去消费他!!
 func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims map[string][]int32, memberID string, generationID int32, handler ConsumerGroupHandler) (*consumerGroupSession, error) {
 	// init offset manager
 	offsets, err := newOffsetManagerFromClient(parent.groupID, memberID, generationID, parent.client)
@@ -576,18 +633,24 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 		hbDead:       make(chan none),
 	}
 
+	// 同一个topic一定治好啊对应的一个协调者； 对于每一个topic，每个客户端和协调者保持心跳，这样才能让别人了解掉这个消费者还活着！！
+	// 一个group可能好几个topic，这样就能对应一个协调者了！！【注意理解这句话！！】
 	// start heartbeat loop
 	go sess.heartbeatLoop()
 
+	//
 	// create a POM for each claim
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
+
+			// 计算，并获取每一topic的每一个partition的偏移量
 			pom, err := offsets.ManagePartition(topic, partition)
 			if err != nil {
 				_ = sess.release(false)
 				return nil, err
 			}
 
+			// 处理偏移量的错误 [TODO: 搞清楚为啥这个代码中这么热衷于这样捕获错误？？] ==> 这种错误处理方式是否有可以借鉴之处！！
 			// handle POM errors
 			go func(topic string, partition int32) {
 				for err := range pom.Errors() {
@@ -597,12 +660,14 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 		}
 	}
 
+	// 这个就是具体的接收消息前，进行的操作，就是用户自定义的setup函数
 	// perform setup
 	if err := handler.Setup(sess); err != nil {
 		_ = sess.release(true)
 		return nil, err
 	}
 
+	// 这里，就开始消费了，对于每一个topic的每一个partition，开启一个协程进行消费了！！
 	// start consuming
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
@@ -615,6 +680,7 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 				// goroutine exits
 				defer sess.cancel()
 
+				// 每一个partition，开启一个协程进行消费!!
 				// consume a single topic/partition, blocking
 				sess.consume(topic, partition)
 			}(topic, partition)
@@ -661,6 +727,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	default:
 	}
 
+	// 实际上就是从前面 通过rpc拿到的偏移量中，获取这个partition自己的偏移来那个.
 	// by sun: 能找到，就强制使用最新的offset
 	// get next offset
 	offset := s.parent.config.Consumer.Offsets.Initial
@@ -668,6 +735,7 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 		offset, _ = pom.NextOffset()
 	}
 
+	// 这里也是相当重要的代码逻辑。
 	// create new claim
 	// ==> by sun:  这里面，会针对partition开单独的协程，每一个协程对应一个partion去进行消费。消费的内容放到一个chan中，对外提供队列式消费功能!!
 	// ==> fixme:  需要注意的是，这里是chan的单通道，也就是，这里看起来，没有所谓的批量消费多少的功能。一次就是取一个。没有消费就会阻塞起来！！
@@ -692,6 +760,9 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 		}
 		claim.AsyncClose()
 	}()
+
+	// 这里是用户自定义逻辑的消费的核心：
+	// 用户通常会自定义 ConsumeClaim函数， 这个函数中，通常会消费消息，并进行处理；之后上报偏移来那个。 【很重要的逻辑】
 
 	// start processing  // 消费者的一个协程将数据放入到了 Messages中，这里只用从中消费！！ chan队列！！
 	if err := s.handler.ConsumeClaim(s, claim); err != nil { // by sun 这个hander就是需要处理的内容！！，用户自定义实现的函数
@@ -853,6 +924,7 @@ func newConsumerGroupClaim(sess *consumerGroupSession, topic string, partition i
 		return nil, err
 	}
 
+	// 这种写法感觉挺大胆的，很自信；如果阻塞了，那岂不是就gg在中间了！！
 	go func() {
 		for err := range pcm.Errors() {
 			sess.parent.handleError(err, topic, partition)

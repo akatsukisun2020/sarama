@@ -37,7 +37,7 @@ type offsetManager struct {
 	broker     *Broker
 	brokerLock sync.RWMutex
 
-	poms     map[string]map[int32]*partitionOffsetManager
+	poms     map[string]map[int32]*partitionOffsetManager //  <topic, partition, 偏移量>
 	pomsLock sync.RWMutex
 
 	closeOnce sync.Once
@@ -80,6 +80,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 
 func (om *offsetManager) ManagePartition(topic string, partition int32) (PartitionOffsetManager, error) {
 	// by sun: 这里有rpc，从broker的协调节点中，获取现有的偏移量!
+	// 每个partition的偏移量，也是存在协调者节点中的!!
 	pom, err := om.newPartitionOffsetManager(topic, partition)
 	if err != nil {
 		return nil, err
@@ -98,7 +99,7 @@ func (om *offsetManager) ManagePartition(topic string, partition int32) (Partiti
 		return nil, ConfigurationError("That topic/partition is already being managed")
 	}
 
-	topicManagers[partition] = pom
+	topicManagers[partition] = pom // 存储每一个topic的每一个partition的偏移量
 	return pom, nil
 }
 
