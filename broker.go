@@ -130,6 +130,11 @@ func NewBroker(addr string) *Broker {
 	return &Broker{id: -1, addr: addr}
 }
 
+// 每个Broker对象会构造一个对服务端broker的连接，并维持。
+// 消息发送的时候，是直接向这个连接扔数据的；
+// 回包接收的时候，是直接从这个连接中读数据的。
+// 感觉这里可能存在问题，，数据可能串！！
+
 // Open tries to connect to the Broker if it is not already connected or connecting, but does not block
 // waiting for the connection to complete. This means that any subsequent operations on the broker will
 // block waiting for the connection to succeed or fail. To get the effect of a fully synchronous Open call,
@@ -339,7 +344,7 @@ func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 		err = b.sendAndReceive(request, nil)
 	} else {
 		response = new(ProduceResponse)
-		err = b.sendAndReceive(request, response)
+		err = b.sendAndReceive(request, response) // 这里后面是通过一个broker的连接协程来进行结果回传的.
 	}
 
 	if err != nil {
@@ -694,7 +699,7 @@ func (b *Broker) DescribeLogDirs(request *DescribeLogDirsRequest) (*DescribeLogD
 
 // readFull ensures the conn ReadDeadline has been setup before making a
 // call to io.ReadFull
-func (b *Broker) readFull(buf []byte) (n int, err error) {
+func (b *Broker) readFull(buf []byte) (n int, err error) { // 这里的读接口，也是自带超时时间的
 	if err := b.conn.SetReadDeadline(time.Now().Add(b.conf.Net.ReadTimeout)); err != nil {
 		return 0, err
 	}
@@ -715,6 +720,8 @@ func (b *Broker) write(buf []byte) (n int, err error) {
 func (b *Broker) send(rb protocolBody, promiseResponse bool, responseHeaderVersion int16) (*responsePromise, error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
+	// 这里之所以加锁，应该是为了保证同一个时间只有一个用户给一个broker发送消息，不然可能会乱序！！
+	// 但是其实严格意义上，还是可能会乱 ==> broker不知道是不是顺序处理的！！
 
 	if b.conn == nil {
 		if b.connErr != nil {
@@ -840,6 +847,7 @@ func (b *Broker) encode(pe packetEncoder, version int16) (err error) {
 	return nil
 }
 
+// responseReceiver 这个response 就是不停守着，拉接受回包请求的！！然后扔给上层！！！
 func (b *Broker) responseReceiver() {
 	var dead error
 
@@ -852,6 +860,7 @@ func (b *Broker) responseReceiver() {
 			continue
 		}
 
+		// 先读取并解析头部
 		var headerLength = getHeaderLength(response.headerVersion)
 		header := make([]byte, headerLength)
 
@@ -872,6 +881,8 @@ func (b *Broker) responseReceiver() {
 			response.errors <- err
 			continue
 		}
+
+		// 这个就是防止乱序的逻辑！！
 		if decodedHeader.correlationID != response.correlationID {
 			b.updateIncomingCommunicationMetrics(bytesReadHeader, requestLatency)
 			// TODO if decoded ID < cur ID, discard until we catch up
@@ -881,6 +892,7 @@ func (b *Broker) responseReceiver() {
 			continue
 		}
 
+		// 在读取并解析负载
 		buf := make([]byte, decodedHeader.length-int32(headerLength)+4)
 		bytesReadBody, err := b.readFull(buf)
 		b.updateIncomingCommunicationMetrics(bytesReadHeader+bytesReadBody, requestLatency)

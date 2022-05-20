@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"git.code.oa.com/trpc-go/trpc-go/log"
 )
 
 // Client is a generic Kafka client. It manages connections to one or more Kafka brokers.
@@ -466,6 +468,7 @@ func (client *client) RefreshBrokers(addrs []string) error {
 	return nil
 }
 
+// 更新节点元数据信息
 func (client *client) RefreshMetadata(topics ...string) error {
 	if client.Closed() {
 		return ErrClosedClient
@@ -482,8 +485,10 @@ func (client *client) RefreshMetadata(topics ...string) error {
 
 	deadline := time.Time{}
 	if client.conf.Metadata.Timeout > 0 {
-		deadline = time.Now().Add(client.conf.Metadata.Timeout)
+		deadline = time.Now().Add(client.conf.Metadata.Timeout) // 这里就是更新元数据的超时时间
 	}
+	log.Debugf("for debug --- topics:%v, attemptsRemaining:%d, timeout:%d",
+		topics, client.conf.Metadata.Retry.Max, client.conf.Metadata.Timeout)
 	return client.tryRefreshMetadata(topics, client.conf.Metadata.Retry.Max, deadline)
 }
 

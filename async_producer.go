@@ -745,7 +745,7 @@ func (bp *brokerProducer) run() {
 
 	for {
 		select {
-		case msg, ok := <-bp.input:
+		case msg, ok := <-bp.input: // (1) 外部写入请求通过input管道进入，然后，放到缓存中进行批量累积
 			if !ok {
 				Logger.Printf("producer/broker/%d input chan closed\n", bp.broker.ID())
 				bp.shutdown()
@@ -796,7 +796,7 @@ func (bp *brokerProducer) run() {
 					continue
 				}
 			}
-			if err := bp.buffer.add(msg); err != nil {
+			if err := bp.buffer.add(msg); err != nil { // (2) 将消息加入到buffer中进行累积
 				bp.parent.returnError(msg, err)
 				continue
 			}
@@ -806,11 +806,14 @@ func (bp *brokerProducer) run() {
 			}
 		case <-bp.timer:
 			bp.timerFired = true
-		case output <- bp.buffer:
+		case output <- bp.buffer: // (4) buffer消息此时就能够写入到chan中了，之后就通过brige协程，将消息通过Broker的client发送出去。
 			bp.rollOver()
-		case response, ok := <-bp.responses:
+		case response, ok := <-bp.responses: // (5) 等到服务端broker回包之后，brige协程就会将请求回包写会到response中，此时，就能够处理回包了！！
 			if ok {
-				bp.handleResponse(response)
+				bp.handleResponse(response) // （6）当发送的结果有错误的时候，这里会进行处理；处理的方式就是关闭掉这个broker；
+				// 但是，关闭broker的时候，需要先关闭底层的 responseReceiver 协程；
+				// 但是，底层的responseReceiver 协程如果刚好此时等待在发送回包到 bp.responses上。此时，就会形成一个死环，死锁了！！
+				// https://github.com/Shopify/sarama/pull/2133
 			}
 		case <-bp.stopchan:
 			Logger.Printf(
@@ -818,7 +821,7 @@ func (bp *brokerProducer) run() {
 			return
 		}
 
-		if bp.timerFired || bp.buffer.readyToFlush() {
+		if bp.timerFired || bp.buffer.readyToFlush() { // (3) 当时间达到了，或者数量达到一定的限制的时候，就开始处理这一批请求
 			output = bp.output
 		} else {
 			output = nil
